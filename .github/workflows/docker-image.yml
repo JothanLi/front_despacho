@@ -26,7 +26,7 @@ jobs:
       - name: Build and push frontend image
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: ./Dockerfile
+          context: ./front_despacho
+          file: ./front_despacho/Dockerfile
           push: true
-          tags: jonlillo/front-despacho:latest
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/front-despacho:latest
