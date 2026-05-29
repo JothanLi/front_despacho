@@ -1,0 +1,11 @@
+services:
+  frontend-despacho:
+    build:
+      context: .
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8082}
+    image: ${DOCKERHUB_USERNAME:-local}/front-despacho:latest
+    container_name: front-despacho
+    ports:
+      - "80:8080"
+    restart: unless-stopped
