@@ -57,7 +57,7 @@ export const FormCierreDespacho = ({ despacho, onClose }) => {
           />
         </div>
         <div className="mb-5">
-          <label className="block font-bold mb-2">Fecha despacho</label>
+          <label className="block font-bold mb-2">Fecha del despacho</label>
           <input
             type="date"
             placeholder="Elige patente de camión"
