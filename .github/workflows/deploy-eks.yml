@@ -1,22 +1,57 @@
-name: Deploy Frontend to EKS
+name: CI/CD Frontend - EKS
 
 on:
+  pull_request:
+    branches: [main]
   push:
-    branches:
-      - main
+    branches: [main, deploy]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
-  ECR_REPOSITORY: innovatech-frontend
-  DEPLOYMENT_NAME: frontend
-  CONTAINER_NAME: frontend
   APP_DIR: front_despacho
+  ECR_REPOSITORY: innovatech-frontend
+  K8S_NAMESPACE: innovatech
 
 jobs:
-  deploy:
+  test:
+    name: Lint, pruebas y build
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout codigo
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.19"
+          cache: npm
+          cache-dependency-path: ${{ env.APP_DIR }}/package-lock.json
+
+      - name: Instalar dependencias
+        working-directory: ${{ env.APP_DIR }}
+        run: npm ci
+
+      - name: Ejecutar validaciones
+        working-directory: ${{ env.APP_DIR }}
+        run: npm run check
+
+      - name: Auditar dependencias de producción
+        working-directory: ${{ env.APP_DIR }}
+        run: npm audit --omit=dev --audit-level=high
+
+  deploy:
+    name: Build, ECR y despliegue EKS
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Configurar credenciales AWS
@@ -27,48 +62,74 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login a Amazon ECR
+      - name: Login en Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Definir tag de imagen
-        run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
-
-      - name: Build y push imagen frontend
+      - name: Definir imagen trazable
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          cd $APP_DIR
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Construir imagen Docker
+        working-directory: ${{ env.APP_DIR }}
+        run: docker build --pull -t "$IMAGE_URI" .
+
+      - name: Escanear vulnerabilidades críticas
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_URI }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Publicar imagen en ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker push "$IMAGE_URI"
+          docker tag "$IMAGE_URI" "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
       - name: Instalar kubectl
         uses: azure/setup-kubectl@v4
         with:
           version: v1.29.0
 
-      - name: Configurar kubeconfig EKS
+      - name: Configurar kubeconfig
         run: |
           aws eks update-kubeconfig \
-            --region ${{ secrets.AWS_REGION }} \
-            --name ${{ secrets.EKS_CLUSTER_NAME }}
+            --region "${{ secrets.AWS_REGION }}" \
+            --name "${{ secrets.EKS_CLUSTER_NAME }}"
 
-      - name: Aplicar manifiestos Kubernetes
+      - name: Desplegar frontend
         run: |
-          kubectl apply -f $APP_DIR/k8s/frontend-deployment.yaml
-          kubectl apply -f $APP_DIR/k8s/frontend-service.yaml
-          kubectl apply -f $APP_DIR/k8s/frontend-hpa.yaml
+          kubectl apply -f "$APP_DIR/k8s/namespace.yaml"
+          sed "s|IMAGE_PLACEHOLDER|$IMAGE_URI|g" \
+            "$APP_DIR/k8s/frontend-deployment.yaml" | kubectl apply -f -
+          kubectl apply -f "$APP_DIR/k8s/frontend-service.yaml"
+          kubectl apply -f "$APP_DIR/k8s/frontend-hpa.yaml"
+          kubectl rollout status deployment/frontend \
+            -n "$K8S_NAMESPACE" --timeout=8m
 
-      - name: Actualizar imagen en EKS
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      - name: Smoke test interno
         run: |
-          kubectl set image deployment/$DEPLOYMENT_NAME \
-            $CONTAINER_NAME=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-            -n ${{ secrets.EKS_NAMESPACE }}
+          kubectl run "frontend-smoke-${GITHUB_RUN_ID}" \
+            -n "$K8S_NAMESPACE" \
+            --image=curlimages/curl:8.10.1 \
+            --restart=Never --rm -i -- \
+            curl -fsS --retry 12 --retry-connrefused --retry-delay 5 \
+            http://frontend-service/health
 
-      - name: Validar rollout
+      - name: Estado final
+        run: kubectl get pods,svc,hpa -n "$K8S_NAMESPACE"
+
+      - name: Diagnóstico en caso de error
+        if: failure()
         run: |
-          kubectl rollout status deployment/$DEPLOYMENT_NAME -n ${{ secrets.EKS_NAMESPACE }}
-          kubectl get pods -n ${{ secrets.EKS_NAMESPACE }}
-          kubectl get svc -n ${{ secrets.EKS_NAMESPACE }}
+          kubectl get all -n "$K8S_NAMESPACE" || true
+          kubectl describe deployment/frontend -n "$K8S_NAMESPACE" || true
+          kubectl logs deployment/frontend -n "$K8S_NAMESPACE" --tail=150 || true

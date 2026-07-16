@@ -1,20 +1,26 @@
-# Etapa 1: build de la app Vite/React
-FROM node:20-alpine AS build
+FROM node:20.19-alpine AS build
 WORKDIR /app
 
 COPY package*.json ./
 RUN npm ci
 
 COPY . .
-ARG VITE_API_URL
-ENV VITE_API_URL=${VITE_API_URL}
 RUN npm run build
 
-# Etapa 2: servidor web mínimo y sin root
 FROM nginxinc/nginx-unprivileged:1.27-alpine
 WORKDIR /usr/share/nginx/html
+
+ENV VENTAS_UPSTREAM=ventas-service:8080 \
+    DESPACHOS_UPSTREAM=despachos-service:8080 \
+    NGINX_ENVSUBST_FILTER='^(VENTAS_UPSTREAM|DESPACHOS_UPSTREAM)$'
+
 COPY --from=build /app/dist ./
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY nginx.conf /etc/nginx/templates/default.conf.template
+
 EXPOSE 8080
 USER 101
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -qO- http://localhost:8080/health || exit 1
+
 CMD ["nginx", "-g", "daemon off;"]

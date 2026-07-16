@@ -1,11 +1,24 @@
 services:
   frontend-despacho:
-    build:
-      context: .
-      args:
-        VITE_API_URL: ${VITE_API_URL:-http://localhost:8082}
-    image: ${DOCKERHUB_USERNAME:-local}/front-despacho:latest
+    build: .
+    image: local/front-despacho:latest
     container_name: front-despacho
+    environment:
+      VENTAS_UPSTREAM: host.docker.internal:8081
+      DESPACHOS_UPSTREAM: host.docker.internal:8082
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "80:8080"
+    networks:
+      - frontend-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
+
+networks:
+  frontend-net:

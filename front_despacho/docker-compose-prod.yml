@@ -1,7 +1,15 @@
 services:
   frontend-despacho:
-    image: ${DOCKERHUB_USERNAME}/front-despacho:latest
-    container_name: front-despacho
+    image: ${FRONTEND_IMAGE}
+    environment:
+      VENTAS_UPSTREAM: ${VENTAS_UPSTREAM}
+      DESPACHOS_UPSTREAM: ${DESPACHOS_UPSTREAM}
     ports:
       - "80:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped

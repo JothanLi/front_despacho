@@ -67,7 +67,7 @@ export const TableDespachos = () => {
                       {despacho.patenteCamion}
                     </td>
                     <td className="pr-10 py-10  items-center">
-                      {despacho.entregado
+                      {despacho.despachado
                         ? "Despacho entregado"
                         : "Despacho pendiente"}
                     </td>
@@ -100,7 +100,8 @@ export const TableDespachos = () => {
             despacho={despachoSeleccionado}
             onClose={() => {
               //onclose es un prop que pasa funciones al modal con el form abierto, por ende al cerrarse, se ejecutan esas 2 funciones
-              setOpenModal(false), despacho();
+              setOpenModal(false);
+              despacho();
             }}
           />
         )}

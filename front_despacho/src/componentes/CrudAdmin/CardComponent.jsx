@@ -1,4 +1,3 @@
-import React from "react";
 
 export const CardComponent = ({ title, description, buttonText, onClick }) => {
   return (

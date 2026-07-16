@@ -90,7 +90,8 @@ export const TableCompras = () => {
             venta={ventaSeleccionada}
             onClose={() => {
               //onclose es un prop que pasa funciones al modal con el form abierto, por ende al cerrarse, se ejecutan esas 2 funciones
-              setOpenModal(false), compras();
+              setOpenModal(false);
+              compras();
             }}
           />
         )}
