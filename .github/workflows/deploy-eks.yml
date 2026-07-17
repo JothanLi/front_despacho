@@ -4,9 +4,13 @@ on:
   workflow_dispatch:
 
   pull_request:
-    branches: [main]
+    branches:
+      - main
+
   push:
-    branches: [main, deploy]
+    branches:
+      - main
+      - deploy
 
 permissions:
   contents: read
@@ -24,6 +28,7 @@ jobs:
   test:
     name: Lint, pruebas y build
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,9 +54,16 @@ jobs:
 
   deploy:
     name: Build, ECR y despliegue EKS
-    if: github.event_name == 'push'
-    needs: test
+
+    # Los pull requests solamente ejecutan validaciones.
+    # Push y ejecución manual realizan el despliegue.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+
+    needs:
+      - test
+
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,6 +76,16 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Verificar identidad AWS y clúster
+        run: |
+          aws sts get-caller-identity
+
+          aws eks describe-cluster \
+            --region "${{ secrets.AWS_REGION }}" \
+            --name "${{ secrets.EKS_CLUSTER_NAME }}" \
+            --query "cluster.{Nombre:name,Estado:status,Version:version}" \
+            --output table
+
       - name: Login en Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
@@ -72,12 +94,21 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
-          echo "IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          IMAGE_TAG="${GITHUB_SHA::7}"
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+          echo "Imagen que será desplegada: $IMAGE_URI"
 
       - name: Construir imagen Docker
         working-directory: ${{ env.APP_DIR }}
-        run: docker build --pull -t "$IMAGE_URI" .
+        run: |
+          docker build \
+            --pull \
+            --tag "$IMAGE_URI" \
+            .
 
       - name: Escanear vulnerabilidades críticas
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
@@ -93,8 +124,13 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
           docker push "$IMAGE_URI"
-          docker tag "$IMAGE_URI" "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+          docker tag \
+            "$IMAGE_URI" \
+            "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+          docker push \
+            "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
       - name: Instalar kubectl
         uses: azure/setup-kubectl@v4
@@ -107,31 +143,155 @@ jobs:
             --region "${{ secrets.AWS_REGION }}" \
             --name "${{ secrets.EKS_CLUSTER_NAME }}"
 
+      - name: Verificar acceso a Kubernetes
+        run: |
+          kubectl config current-context
+          kubectl auth can-i get pods --all-namespaces
+          kubectl get namespaces
+
       - name: Desplegar frontend
         run: |
-          kubectl apply -f "$APP_DIR/k8s/namespace.yaml"
-          sed "s|IMAGE_PLACEHOLDER|$IMAGE_URI|g" \
-            "$APP_DIR/k8s/frontend-deployment.yaml" | kubectl apply -f -
-          kubectl apply -f "$APP_DIR/k8s/frontend-service.yaml"
-          kubectl apply -f "$APP_DIR/k8s/frontend-hpa.yaml"
-          kubectl rollout status deployment/frontend \
-            -n "$K8S_NAMESPACE" --timeout=8m
+          kubectl apply \
+            -f "$APP_DIR/k8s/namespace.yaml"
 
-      - name: Smoke test interno
+          sed "s|IMAGE_PLACEHOLDER|$IMAGE_URI|g" \
+            "$APP_DIR/k8s/frontend-deployment.yaml" |
+            kubectl apply -f -
+
+          kubectl apply \
+            -f "$APP_DIR/k8s/frontend-service.yaml"
+
+          kubectl rollout status deployment/frontend \
+            --namespace "$K8S_NAMESPACE" \
+            --timeout=12m
+
+      - name: Smoke test interno del frontend
         run: |
           kubectl run "frontend-smoke-${GITHUB_RUN_ID}" \
-            -n "$K8S_NAMESPACE" \
+            --namespace "$K8S_NAMESPACE" \
             --image=curlimages/curl:8.10.1 \
-            --restart=Never --rm -i -- \
-            curl -fsS --retry 12 --retry-connrefused --retry-delay 5 \
-            http://frontend-service/health
+            --restart=Never \
+            --rm \
+            --attach \
+            -- \
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --retry 12 \
+              --retry-connrefused \
+              --retry-delay 5 \
+              http://frontend-service/health
+
+      - name: Esperar Load Balancer público
+        run: |
+          echo "Esperando hostname del Load Balancer..."
+
+          LB_HOST=""
+
+          for intento in {1..60}; do
+            LB_HOST=$(kubectl get service frontend-service \
+              --namespace "$K8S_NAMESPACE" \
+              --output jsonpath='{.status.loadBalancer.ingress[0].hostname}' \
+              2>/dev/null || true)
+
+            if [ -n "$LB_HOST" ]; then
+              echo "Load Balancer encontrado: $LB_HOST"
+              break
+            fi
+
+            echo "Intento $intento de 60: Load Balancer todavía pendiente..."
+            sleep 10
+          done
+
+          if [ -z "$LB_HOST" ]; then
+            echo "No se obtuvo el hostname público del Load Balancer."
+            kubectl describe service frontend-service \
+              --namespace "$K8S_NAMESPACE"
+            exit 1
+          fi
+
+          echo "LB_HOST=$LB_HOST" >> "$GITHUB_ENV"
+          echo "FRONTEND_URL=http://$LB_HOST" >> "$GITHUB_ENV"
+
+      - name: Smoke test público del frontend
+        run: |
+          echo "Probando $FRONTEND_URL/health"
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 20 \
+            --retry-all-errors \
+            --retry-delay 10 \
+            "$FRONTEND_URL/health"
+
+      - name: Verificar integración pública con Ventas
+        run: |
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 12 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            "$FRONTEND_URL/api/v1/ventas"
+
+      - name: Verificar integración pública con Despachos
+        run: |
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 12 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            "$FRONTEND_URL/api/v1/despachos"
 
       - name: Estado final
-        run: kubectl get pods,svc,hpa -n "$K8S_NAMESPACE"
+        run: |
+          echo "=== URL pública ==="
+          echo "$FRONTEND_URL"
+
+          echo "=== Deployments ==="
+          kubectl get deployments \
+            --namespace "$K8S_NAMESPACE"
+
+          echo "=== Pods ==="
+          kubectl get pods \
+            --namespace "$K8S_NAMESPACE" \
+            --output wide
+
+          echo "=== Servicios ==="
+          kubectl get services \
+            --namespace "$K8S_NAMESPACE"
+
+          echo "=== Endpoints ==="
+          kubectl get endpoints \
+            --namespace "$K8S_NAMESPACE"
 
       - name: Diagnóstico en caso de error
         if: failure()
         run: |
-          kubectl get all -n "$K8S_NAMESPACE" || true
-          kubectl describe deployment/frontend -n "$K8S_NAMESPACE" || true
-          kubectl logs deployment/frontend -n "$K8S_NAMESPACE" --tail=150 || true
+          echo "=== Recursos generales ==="
+          kubectl get all \
+            --namespace "$K8S_NAMESPACE" || true
+
+          echo "=== Eventos recientes ==="
+          kubectl get events \
+            --namespace "$K8S_NAMESPACE" \
+            --sort-by=.metadata.creationTimestamp || true
+
+          echo "=== Descripción del frontend ==="
+          kubectl describe deployment/frontend \
+            --namespace "$K8S_NAMESPACE" || true
+
+          echo "=== Descripción del Load Balancer ==="
+          kubectl describe service/frontend-service \
+            --namespace "$K8S_NAMESPACE" || true
+
+          echo "=== Logs del frontend ==="
+          kubectl logs deployment/frontend \
+            --namespace "$K8S_NAMESPACE" \
+            --tail=150 || true
