@@ -42,7 +42,7 @@ jobs:
 
       - name: Instalar dependencias
         working-directory: ${{ env.APP_DIR }}
-        run: npm ci
+        run: npm install
 
       - name: Ejecutar validaciones
         working-directory: ${{ env.APP_DIR }}
