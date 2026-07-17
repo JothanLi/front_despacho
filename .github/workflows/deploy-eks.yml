@@ -161,6 +161,9 @@ jobs:
           kubectl apply \
             -f "$APP_DIR/k8s/frontend-service.yaml"
 
+          kubectl apply \
+            -f "$APP_DIR/k8s/frontend-hpa.yaml"
+
           kubectl rollout status deployment/frontend \
             --namespace "$K8S_NAMESPACE" \
             --timeout=12m
